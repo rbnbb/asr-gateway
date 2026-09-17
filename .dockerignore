@@ -1,0 +1,5 @@
+*
+!pyproject.toml
+!asr_gateway/
+!asr_gateway/*.py
+!asr_gateway/recorder.html

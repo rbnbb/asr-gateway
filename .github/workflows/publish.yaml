@@ -1,0 +1,36 @@
+name: Publish container
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Image version, for example 0.1.0'
+        required: true
+permissions:
+  contents: read
+  packages: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s tests -v
+        env:
+          ASR_NETWORK_TESTS: '1'
+      - name: Build and publish explicit version
+        env:
+          VERSION: ${{ inputs.version }}
+          REPOSITORY: ${{ github.repository }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY_USER: ${{ github.actor }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          IMAGE="ghcr.io/${REPOSITORY,,}"
+          docker build --label "org.opencontainers.image.source=https://github.com/$REPOSITORY" -t "$IMAGE:$VERSION" .
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$REGISTRY_USER" --password-stdin
+          docker push "$IMAGE:$VERSION"
+          docker logout ghcr.io

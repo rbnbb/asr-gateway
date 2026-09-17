@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+*.sqlite3*
+*.lock
+__pycache__/
+.venv/
+*.egg-info/
+build/
+dist/
+data/
+*.wav
+*.mp3
+*.webm
