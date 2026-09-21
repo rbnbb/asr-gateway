@@ -25,3 +25,4 @@ jobs:
           python -m playwright install --with-deps chromium
           python tests/browser_login.py
       - run: docker build -t asr-gateway:test .
+      - run: bash tests/container_port.sh

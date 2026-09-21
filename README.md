@@ -24,7 +24,9 @@ The supplied `host.docker.internal:host-gateway` mapping is for Linux Docker. Ve
 docker compose up --build -d
 ```
 
-The example binds only to localhost port 8080. Connect the service to your existing Traefik network and route HTTPS to container port 8080, or use the localhost port from a host-side proxy. A Traefik container cannot reach this service through its own localhost. Add your existing network configuration locally; it is intentionally not guessed here.
+Set `PORT=8282` (or your chosen port) in `.env` to configure Gunicorn, the health check, and the Compose host/container port mapping together. The default is 8080. Remove older hardcoded `command`, `ports`, or health-check overrides that conflict with it. In your private Traefik labels, use `${PORT:-8080}` for the service target port. `EXPOSE` records the image default; runtime binding/publishing is controlled by `PORT` and Compose. The shell entry command uses `exec` so Gunicorn receives container signals directly.
+
+The example binds only to localhost on the selected port. Connect the service to your existing Traefik network and route HTTPS to the configured container port, or use the localhost port from a host-side proxy. A Traefik container cannot reach this service through its own localhost. Add your existing network configuration locally; it is intentionally not guessed here.
 
 Keep one Gunicorn process and one replica. The dispatcher uses an exclusive file lock; do not use `--preload` or attempt multiple replicas. The SQLite volume must be local storage, not NFS. The example is intended for modest trusted-user concurrency, not an unauthenticated internet endpoint.
 

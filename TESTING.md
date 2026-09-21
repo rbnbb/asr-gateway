@@ -8,7 +8,7 @@ Keep real addresses, credentials, and recordings outside this public document. N
 
 ```sh
 # Change this to your published HOST port, e.g. 8282.
-ASR_PORT=8080
+ASR_PORT=$(docker compose exec -T gateway printenv PORT)
 ASR_URL="http://127.0.0.1:$ASR_PORT"
 ASR_KEY=$(docker compose exec -T gateway printenv ASR_API_KEY)
 ASR_MODEL=$(docker compose exec -T gateway printenv ASR_MODEL)
@@ -30,10 +30,10 @@ docker compose config --quiet
 docker compose ps
 docker compose logs --tail=50 gateway
 docker compose exec gateway python -c \
-  'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8080/health").read().decode())'
+  'import os, urllib.request; print(urllib.request.urlopen("http://127.0.0.1:" + os.environ["PORT"] + "/health").read().decode())'
 ```
 
-The last command uses the container's listening port. Change its `8080` if you changed Gunicorn's port as well as the host port. Expected: running/healthy and `{"status":"ok"}`. A sleeping Speaches backend does not make the gateway unhealthy.
+Set `PORT` once in `.env`; the commands read the running container's value. Expected: running/healthy and `{"status":"ok"}`. A sleeping Speaches backend does not make the gateway unhealthy.
 
 ## 2. Host access and authentication
 
