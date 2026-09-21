@@ -4,7 +4,9 @@ Record once, even when your transcription server is asleep.
 
 An initial single-owner gateway for an existing Speaches deployment. It durably accepts a multipart audio upload, wakes a backend if necessary, waits for readiness, forwards the upload, and retains the transcription for retrieval. It runs on an always-on CPU host; inference remains on your existing GPU machine.
 
-**Status:** first implementation. Local queue and WSGI tests have run; real socket tests, the container build, Open WebUI integration, and browser microphone behavior still need validation outside the development sandbox. No image has been published. This is not yet a verified drop-in production deployment.
+**Status:** first implementation. Local queue/WSGI tests passed. The operator has built and run the container and verified real backend routing, wake-triggered transcription, and recovery of unfinished work across a gateway restart. Traefik ingress, Open WebUI integration, and browser microphone behavior remain to be validated. These checks do not establish general deployment compatibility.
+
+Follow [TESTING.md](TESTING.md) for the copy-paste integration test ladder: shell variables, routing diagnostics, audio uploads, cold start, restart recovery, Traefik, the recorder, and Open WebUI.
 
 ## Run on your own host
 
@@ -99,6 +101,6 @@ The container uses Gunicorn; the dependency-free development entry point is `pyt
 
 The manual **Publish container** workflow tests, builds, and publishes `ghcr.io/<repository-owner>/<repository-name>:<version>`. Invoke it with a numeric version such as `0.1.0`; publishing is never triggered by a pull request. Make the GHCR package public afterward. The image build context has an allowlist, excluding runtime configuration and recordings. The first image targets the CI runner's amd64 architecture, suitable for the intended CPU host.
 
-## Next real-hardware acceptance test
+## Real-hardware acceptance tests
 
-Start with the GPU host asleep. Submit synthetic/non-private audio through curl. Confirm exactly one TCP wake trigger, retained request state while booting, and the final transcription without resubmission. Repeat through Open WebUI, then restart the gateway while a job waits and retrieve that job through the asynchronous endpoint. Do not claim hardware compatibility until these checks pass.
+Wake-triggered transcription and async restart recovery have passed on the operator's deployment. Continue with [the Traefik ingress test](TESTING.md#9-gateway-through-traefik), then the recorder and Open WebUI. The runbook records what has been tested and what remains pending.
