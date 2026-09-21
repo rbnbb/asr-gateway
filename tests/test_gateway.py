@@ -11,9 +11,11 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError
+from urllib.parse import urlencode
 
 from asr_gateway.core import Backend, CapacityError, Config, ConflictError, Dispatcher, Store
 from asr_gateway.web import App
+from asr_gateway import session
 
 KEY = "a-test-key-with-at-least-24-characters"
 TYPE = "multipart/form-data; boundary=test-boundary"
@@ -176,7 +178,7 @@ time.sleep(60)
         job_id = self.store.submit(AUDIO, TYPE)
         backend = FakeBackend()
         def fail(job):
-            raise HTTPError("http://example.test", 400, "invalid audio", {}, None)
+            raise HTTPError("http://example.test", 400, "invalid audio", {}, io.BytesIO(b""))
         backend.transcribe = fail
         Dispatcher(self.store, backend).process(self.store.claim())
         self.assertEqual(self.store.get(job_id)["state"], "failed")
@@ -279,6 +281,171 @@ time.sleep(60)
     def test_dead_dispatcher_makes_health_fail(self):
         self.app = App(self.store, healthy=lambda: False)
         self.assertEqual(self.call("/health")[0], 503)
+
+    def test_wake_failure_still_waits_for_readiness(self):
+        job_id = self.store.submit(AUDIO, TYPE)
+        backend = FakeBackend()
+        polls = []
+        def ready():
+            polls.append(True)
+            return len(polls) >= 4
+        def wake():
+            raise ConnectionRefusedError(111, "private-host-and-key")
+        backend.ready, backend.wake = ready, wake
+        with self.assertLogs("asr_gateway", level="INFO") as logs:
+            Dispatcher(self.store, backend).process(self.store.claim())
+        self.assertEqual(self.store.get(job_id)["state"], "succeeded")
+        self.assertEqual(self.store.get(job_id)["attempts"], 1)
+        output = "\n".join(logs.output)
+        self.assertIn('"event": "wake_failed"', output)
+        self.assertIn('"errno": 111', output)
+        self.assertNotIn("private-host-and-key", output)
+
+    def test_wake_failure_retries_within_one_startup_window(self):
+        self.config.ready_timeout = 0.04
+        self.config.wake_retry_seconds = 0.005
+        job_id = self.store.submit(AUDIO, TYPE)
+        backend = FakeBackend()
+        def wake():
+            backend.wakes += 1
+            raise ConnectionRefusedError(111, "synthetic")
+        backend.wake = wake
+        started = time.monotonic()
+        Dispatcher(self.store, backend).process(self.store.claim())
+        self.assertGreaterEqual(time.monotonic()-started, self.config.ready_timeout)
+        self.assertGreater(backend.wakes, 1)
+        self.assertEqual(self.store.get(job_id)["attempts"], 1)
+        self.assertEqual(self.store.get(job_id)["error"], "backend_not_ready")
+
+    def test_failed_recording_retained_and_explicit_retry_is_idempotent(self):
+        job_id = self.store.submit(AUDIO, TYPE)
+        self.store.fail(self.store.claim(), "backend_connection_error")
+        self.assertEqual(self.store.get(job_id)["body"], AUDIO)
+        self.assertTrue(json.loads(self.call("/jobs/"+job_id)[1])["retryable"])
+        url = "/jobs/"+job_id+"/retry"
+        status, body, _ = self.call(url, "POST", HTTP_IDEMPOTENCY_KEY="retry-once")
+        new_id = json.loads(body)["id"]
+        self.assertEqual(status, 202)
+        self.assertNotEqual(new_id, job_id)
+        self.assertEqual(json.loads(self.call(url, "POST", HTTP_IDEMPOTENCY_KEY="retry-once")[1])["id"], new_id)
+        self.assertEqual(self.store.get(job_id)["state"], "failed")
+        Dispatcher(self.store, FakeBackend()).process(self.store.claim())
+        self.assertEqual(self.store.get(new_id)["state"], "succeeded")
+
+    def test_retry_checks_auth_state_and_key(self):
+        job_id = self.store.submit(AUDIO, TYPE)
+        url = "/jobs/"+job_id+"/retry"
+        self.assertEqual(self.call(url, "POST", auth="wrong")[0], 401)
+        self.assertEqual(self.call(url, "POST")[0], 400)
+        self.assertEqual(self.call(url, "POST", HTTP_IDEMPOTENCY_KEY="one")[0], 409)
+        self.store.fail(self.store.claim(), "old_version_failed")
+        with self.store.connect() as db:
+            db.execute("UPDATE jobs SET body=NULL WHERE id=?", (job_id,))
+        self.assertEqual(self.call(url, "POST", HTTP_IDEMPOTENCY_KEY="one")[0], 409)
+
+    def test_retry_storage_limit_and_expired_audio(self):
+        job_id = self.store.submit(AUDIO, TYPE)
+        self.store.fail(self.store.claim(), "failed")
+        self.config.max_storage = len(AUDIO)
+        url = "/jobs/"+job_id+"/retry"
+        self.assertEqual(self.call(url, "POST", HTTP_IDEMPOTENCY_KEY="one")[0], 503)
+        with self.store.connect() as db:
+            db.execute("UPDATE jobs SET updated=0 WHERE id=?", (job_id,))
+        self.store.cleanup()
+        self.assertEqual(self.call(url, "POST", HTTP_IDEMPOTENCY_KEY="one")[0], 404)
+
+    def test_transcription_error_logs_stage_without_payload(self):
+        self.store.submit(AUDIO, TYPE)
+        backend = FakeBackend()
+        def transcribe(job):
+            raise ConnectionResetError(104, "secret-backend-url")
+        backend.transcribe = transcribe
+        with self.assertLogs("asr_gateway", level="INFO") as logs:
+            Dispatcher(self.store, backend).process(self.store.claim())
+        output = "\n".join(logs.output)
+        self.assertIn('"stage": "transcription"', output)
+        self.assertIn('"exception_type": "ConnectionResetError"', output)
+        self.assertNotIn("secret-backend-url", output)
+        self.assertNotIn("synthetic-audio", output)
+
+    def test_recorder_script_is_served(self):
+        status, body, headers = self.call("/recorder.js", auth="")
+        self.assertEqual(status, 200)
+        self.assertIn(b"async function poll", body)
+        self.assertEqual(headers["Content-Type"], "text/javascript; charset=utf-8")
+
+    def test_browser_login_and_authenticated_reads(self):
+        status, _, headers = self.call("/session", "POST")
+        self.assertEqual(status, 200)
+        cookie = headers["Set-Cookie"]
+        for flag in ("HttpOnly", "Secure", "SameSite=Strict", "Path=/"):
+            self.assertIn(flag, cookie)
+        self.assertNotIn(KEY, cookie)
+        self.assertEqual(self.call("/v1/models", auth="", HTTP_COOKIE=cookie)[0], 200)
+        self.assertEqual(self.call("/session", auth="", HTTP_COOKIE=cookie)[0], 200)
+
+    def test_browser_mutations_require_same_https_origin(self):
+        cookie = session.cookie_header(session.issue(session.signing_key(self.config), 60), 60)
+        self.assertEqual(self.call("/jobs", "POST", AUDIO, auth="", HTTP_COOKIE=cookie)[0], 403)
+        self.assertEqual(self.call("/jobs", "POST", AUDIO, auth="", HTTP_COOKIE=cookie,
+                                   HTTP_HOST="asr.example.test", HTTP_ORIGIN="https://evil.example.test")[0], 403)
+        self.assertEqual(self.call("/jobs", "POST", AUDIO, auth="", HTTP_COOKIE=cookie,
+                                   HTTP_HOST="asr.example.test", HTTP_ORIGIN="https://asr.example.test")[0], 202)
+
+    def test_expired_tampered_and_rotated_sessions_fail(self):
+        for token in (session.issue(session.signing_key(self.config), -1), session.issue("another-key", 60), session.issue(session.signing_key(self.config), 60)+"x"):
+            cookie = session.cookie_header(token, 60)
+            self.assertEqual(self.call("/session", auth="", HTTP_COOKIE=cookie)[0], 401)
+
+    def test_signout_clears_cookie_and_cookie_cannot_renew_itself(self):
+        cookie = session.cookie_header(session.issue(session.signing_key(self.config), 60), 60)
+        kwargs = dict(auth="", HTTP_COOKIE=cookie, HTTP_HOST="asr.example.test", HTTP_ORIGIN="https://asr.example.test")
+        self.assertEqual(self.call("/session", "POST", **kwargs)[0], 401)
+        status, _, headers = self.call("/session", "DELETE", **kwargs)
+        self.assertEqual(status, 200)
+        self.assertIn("Max-Age=0", headers["Set-Cookie"])
+
+    def test_native_browser_form_login_with_separate_credentials(self):
+        self.config.browser_username = "my-owner"
+        self.config.browser_password = "a separate long test passphrase"
+        form = urlencode({"username": "my-owner", "password": self.config.browser_password}).encode()
+        status, body, headers = self.call("/login", "POST", form, auth="",
+            CONTENT_TYPE="application/x-www-form-urlencoded", HTTP_HOST="asr.example.test", HTTP_ORIGIN="https://asr.example.test")
+        self.assertEqual((status, headers["Location"]), (303, "/"))
+        cookie = headers["Set-Cookie"]
+        self.assertTrue(session.valid(cookie, session.signing_key(self.config)))
+        self.assertEqual(self.call("/jobs", "POST", AUDIO, auth=self.config.browser_password)[0], 401)
+        self.assertEqual(self.call("/v1/models")[0], 200)  # API key still works.
+        self.config.browser_password = "a changed long test passphrase"
+        self.assertEqual(self.call("/session", auth="", HTTP_COOKIE=cookie)[0], 401)
+
+    def test_native_login_rejects_wrong_username_password_and_origin(self):
+        for username, password in (("wrong", KEY), ("owner", "wrong")):
+            form = urlencode({"username": username, "password": password}).encode()
+            status, _, headers = self.call("/login", "POST", form, auth="",
+                CONTENT_TYPE="application/x-www-form-urlencoded", HTTP_HOST="asr.example.test", HTTP_ORIGIN="https://asr.example.test")
+            self.assertEqual((status, headers["Location"]), (303, "/?login=failed"))
+            self.assertNotIn("Set-Cookie", headers)
+        form = urlencode({"username": "owner", "password": KEY}).encode()
+        self.assertEqual(self.call("/login", "POST", form, auth="",
+            CONTENT_TYPE="application/x-www-form-urlencoded", HTTP_HOST="asr.example.test", HTTP_ORIGIN="https://evil.example.test")[0], 403)
+
+    def test_native_login_fallback_and_malformed_forms(self):
+        form = urlencode({"username": "owner", "password": KEY}).encode()
+        kwargs = dict(auth="", CONTENT_TYPE="application/x-www-form-urlencoded", HTTP_HOST="asr.example.test", HTTP_ORIGIN="https://asr.example.test")
+        self.assertEqual(self.call("/login", "POST", form, **kwargs)[0], 303)
+        self.assertEqual(self.call("/login", "POST", b"", **kwargs)[0], 400)
+        self.assertEqual(self.call("/login", "POST", b"x"*8193, **kwargs)[0], 400)
+
+    def test_diagnostics_cli_reads_metadata_without_audio(self):
+        job_id = self.store.submit(AUDIO, TYPE)
+        result = subprocess.run([sys.executable, "-m", "asr_gateway.jobs", "--recent", "1"],
+            env={**os.environ, "ASR_DATABASE": self.config.database}, capture_output=True, text=True, check=True)
+        data = json.loads(result.stdout)
+        self.assertEqual(data[0]["id"], job_id)
+        self.assertTrue(data[0]["has_audio"])
+        self.assertNotIn("synthetic-audio", result.stdout)
+        self.assertNotIn(KEY, result.stdout)
 
 
 if __name__ == "__main__":

@@ -1,12 +1,15 @@
 """One Gunicorn process owns the dispatcher; fail closed on a second owner."""
 import fcntl
+import logging
 import os
+import sys
 import threading
 
 from .core import Backend, Config, Dispatcher, Store
 from .web import App
 
 os.umask(0o077)
+logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(asctime)s %(message)s")
 config = Config.from_env()
 config.validate()
 store = Store(config)

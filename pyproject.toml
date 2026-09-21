@@ -10,4 +10,4 @@ requires-python = ">=3.10"
 dependencies = ["gunicorn==23.0.0"]
 
 [tool.setuptools.package-data]
-asr_gateway = ["recorder.html"]
+asr_gateway = ["recorder.html", "recorder.js"]

@@ -209,12 +209,12 @@ If only the proxy path fails, inspect its router, target container port, body li
 ## 10. Recorder page
 
 1. Open the gateway's HTTPS root URL `/`.
-2. Enter the gateway key and exact model ID. Allow microphone access.
+2. Sign in with your browser username/password and optionally save them in your password manager. The configured model is selected automatically. Allow microphone access.
 3. Record a short sentence, press Stop, and wait for text. Test Copy.
 4. Repeat with the GPU asleep; watch for waking/transcribing status.
-5. On another cold run, reload **after upload has been accepted** (e.g. the page says queued/waking). Re-enter the key and press **Check saved job**.
+5. On another cold run, reload **after upload has been accepted** (e.g. the page says queued/waking). Press **Check saved job**; your browser session should still be signed in.
 
-Expected: text without re-recording after accepted-job reload. The key is not saved; only the latest accepted job ID is saved in this browser. An unaccepted recording exists only in page memory and is lost on reload. A plain HTTP LAN URL does not provide the browser secure context needed for microphone access.
+Expected: text without re-recording after accepted-job reload. Authentication uses a Secure, HttpOnly session cookie. The latest job ID and selected model are saved separately in localStorage. An unaccepted recording exists only in page memory and is lost on reload. A plain HTTP LAN URL does not provide the browser secure context needed for microphone access.
 
 ## 11. Open WebUI
 
@@ -224,4 +224,37 @@ Test short speech with the GPU awake, then asleep. Expected: text appears from o
 
 ## Verification record
 
-Operator-reported on 2026-09-21: container startup/health, authentication, real Speaches health/model routing, wake-triggered transcription, and async recovery of an unfinished job across gateway restart passed. The recovery run finished about 66.5 seconds after submission with two attempts and a retained result. Traefik ingress, browser recording, and Open WebUI checks above remain pending. No private addresses, job IDs, credentials, or audio are recorded here.
+Operator-reported on 2026-09-21: container startup/health, authentication, real Speaches health/model routing, wake-triggered transcription, and async recovery of an unfinished job across gateway restart passed. The recovery run finished about 66.5 seconds after submission with two attempts and a retained result. Traefik browser ingress was subsequently exercised, but a browser transcription failed within about ten seconds. The new diagnostic/retry/login changes need another deployment check. Open WebUI remains pending. No private addresses, job IDs, credentials, or audio are recorded here.
+
+## 12. Diagnose and recover a failed browser job
+
+After updating the source and setting `ASR_BROWSER_USERNAME` / `ASR_BROWSER_PASSWORD` privately in `.env`:
+
+```sh
+docker compose up -d --build --force-recreate gateway
+docker compose logs -f --tail=100 gateway
+```
+
+In a second terminal, inspect recent jobs without exposing recordings or transcripts:
+
+```sh
+docker compose exec gateway python -m asr_gateway.jobs --recent 5
+# Or inspect the job ID displayed by the recorder:
+docker compose exec gateway python -m asr_gateway.jobs JOB_ID
+```
+
+A failed job is terminal: waiting will not make it succeed. If `has_audio` is true, use **Retry transcription** on the page. If false (including older failures before retention was implemented), record again. A connection error while polling is different: **Check saved job** resumes retrieval of the same ongoing job.
+
+To retry through curl, set `ASR_JOB` to the failed job ID. Generate `ASR_RETRY_KEY` once, and reuse it if the retry request's response is lost:
+
+```sh
+ASR_RETRY_KEY=$(python3 -c 'import uuid; print(uuid.uuid4())')
+curl --fail-with-body --silent --show-error -X POST \
+  "$ASR_URL/jobs/$ASR_JOB/retry" \
+  -H "Authorization: Bearer $ASR_KEY" \
+  -H "Idempotency-Key: $ASR_RETRY_KEY"
+```
+
+The response gives a new job ID. The old failed job remains available for diagnosis. Do not publish raw logs without review, even though application job events intentionally omit infrastructure addresses and payloads.
+
+Browser login check: submit the normal username/password form, confirm return to `/` with the model dropdown populated, reload and confirm the session persists, then sign out and confirm protected job reads require authentication again. The password manager should be able to recognize the form; verify its actual save/fill behavior on your browser. The configured username is `owner` unless changed. If `ASR_BROWSER_PASSWORD` is empty, the browser password falls back to `ASR_API_KEY`.

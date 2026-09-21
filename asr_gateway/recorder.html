@@ -2,26 +2,18 @@
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Record once</title>
 <style>
-body{font:17px system-ui;background:#f5f3ee;color:#252b2b;max-width:640px;margin:7vh auto;padding:24px}h1{font-size:40px;letter-spacing:-1.5px}label{display:block;margin:20px 0 8px}input,textarea{box-sizing:border-box;width:100%;padding:12px;border:1px solid #b7bdb8;border-radius:8px;background:white;font:inherit}button{padding:12px 18px;font:inherit;cursor:pointer;border:1px solid #b7bdb8;border-radius:8px;background:white}#record{display:block;width:104px;height:104px;border-radius:50%;margin:32px auto;background:#c93838;color:white;border:8px solid #f0d5d0}button:disabled{opacity:.5;cursor:default}#status{min-height:2em;text-align:center}textarea{min-height:180px}small{color:#55605b}#retry{display:none}
+body{font:17px system-ui;background:#f5f3ee;color:#252b2b;max-width:640px;margin:7vh auto;padding:24px}h1{font-size:40px;letter-spacing:-1.5px}label{display:block;margin:20px 0 8px}input,textarea,select{box-sizing:border-box;width:100%;padding:12px;border:1px solid #b7bdb8;border-radius:8px;background:white;font:inherit}button{padding:12px 18px;font:inherit;cursor:pointer;border:1px solid #b7bdb8;border-radius:8px;background:white}#record{display:block;width:104px;height:104px;border-radius:50%;margin:32px auto;background:#c93838;color:white;border:8px solid #f0d5d0}button:disabled{opacity:.5;cursor:default}#status{min-height:2em;text-align:center}textarea{min-height:180px}small{color:#55605b}#retry{display:none}
 </style>
 <h1>Record once.</h1><p>Your transcription server can wake up while you wait.</p>
-<label for="key">Gateway key</label><input id="key" type="password" autocomplete="off"><small>Kept in this page’s memory only.</small>
-<label for="model">Model</label><input id="model" placeholder="The model ID configured in Speaches">
+<form id="login" action="/login" method="post">
+<label for="username">Username</label><input id="username" name="username" value="owner" autocomplete="username" required>
+<label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required>
+<small>Sign in once on this device. Your password manager can save and sync this login.</small>
+<p><button type="submit">Sign in</button></p></form>
+<p id="signed-in" hidden>Signed in on this device. <button id="logout">Sign out</button></p>
+<label for="model">Model</label><select id="model" disabled><option value="">Sign in to load models</option></select>
 <button id="record" aria-label="Start recording">Record</button>
-<p id="status" role="status">Ready to record.</p><button id="retry">Retry upload</button> <button id="resume">Check saved job</button>
+<p id="status" role="status">Ready to record.</p><button id="retry">Retry upload</button> <button id="resume">Check saved job</button> <button id="retry-job" hidden>Retry transcription</button>
+<p id="job" role="status"></p>
 <label for="result">Transcription</label><textarea id="result" readonly></textarea><button id="copy">Copy text</button>
-<script>
-const el=id=>document.getElementById(id);let recorder,stream,chunks=[],upload=null,pending=false;
-const status=text=>el('status').textContent=text;
-const headers=()=>({Authorization:'Bearer '+el('key').value});
-async function request(url,options={}){const r=await fetch(url,{...options,headers:{...headers(),...options.headers}});if(!r.ok)throw Error('Request failed ('+r.status+').');return r;}
-async function poll(id){pending=true;el('record').disabled=true;try{for(;;){const j=await(await request('/jobs/'+id)).json();status(j.state==='waking'?'Waking transcription server…':j.state==='transcribing'?'Transcribing…':j.state);
-if(j.state==='failed')throw Error('Transcription failed: '+j.error);
-if(j.state==='succeeded'){const r=await request('/jobs/'+id+'/result');el('result').value=r.headers.get('content-type').includes('json')?(await r.json()).text:await r.text();localStorage.removeItem('asr-job');status('Ready to copy.');break;}await new Promise(r=>setTimeout(r,1500));}}finally{pending=false;el('record').disabled=false;}}
-async function submit(){el('retry').style.display='none';el('record').disabled=true;try{status('Uploading…');const j=await(await request('/jobs',{method:'POST',headers:{'Content-Type':upload.type,'Idempotency-Key':upload.key},body:upload.body})).json();localStorage.setItem('asr-job',j.id);upload=null;await poll(j.id);}catch(e){status(e.message);if(upload)el('retry').style.display='inline-block';}finally{el('record').disabled=false;}}
-el('retry').onclick=submit;
-el('record').onclick=async()=>{try{if(recorder&&recorder.state==='recording'){recorder.stop();return;}if(!el('key').value||!el('model').value)throw Error('Enter your key and model first.');stream=await navigator.mediaDevices.getUserMedia({audio:true});chunks=[];recorder=new MediaRecorder(stream);recorder.ondataavailable=e=>{if(e.data.size)chunks.push(e.data);};recorder.onstop=async()=>{stream.getTracks().forEach(t=>t.stop());el('record').textContent='Record';const type=recorder.mimeType,form=new FormData();form.append('file',new Blob(chunks,{type}),'recording.'+(type.includes('mp4')?'mp4':type.includes('ogg')?'ogg':'webm'));form.append('model',el('model').value);form.append('response_format','json');const req=new Request(location.origin+'/jobs',{method:'POST',body:form});upload={body:await req.arrayBuffer(),type:req.headers.get('Content-Type'),key:crypto.randomUUID()};await submit();};recorder.start();el('record').textContent='Stop';status('Recording…');}catch(e){if(stream)stream.getTracks().forEach(t=>t.stop());status(e.message);}};
-el('resume').onclick=async()=>{if(pending)return;const id=localStorage.getItem('asr-job');if(!id)return status('No saved job.');try{await poll(id);}catch(e){status(e.message);}};
-el('copy').onclick=async()=>{try{await navigator.clipboard.writeText(el('result').value);status('Copied.');}catch(e){status('Select the text and copy it manually.');}};
-window.addEventListener('beforeunload',e=>{if(upload||(recorder&&recorder.state==='recording')){e.preventDefault();e.returnValue='';}});
-</script></html>
+<script src="/recorder.js"></script></html>

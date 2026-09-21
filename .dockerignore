@@ -3,3 +3,4 @@
 !asr_gateway/
 !asr_gateway/*.py
 !asr_gateway/recorder.html
+!asr_gateway/recorder.js

@@ -1,6 +1,7 @@
 """Durable queue, one dispatcher, and replaceable wake/backend adapters."""
 import hashlib
 import json
+import logging
 import os
 import socket
 import sqlite3
@@ -12,6 +13,24 @@ from dataclasses import dataclass
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, build_opener, ProxyHandler, HTTPRedirectHandler
+
+
+logger = logging.getLogger("asr_gateway")
+
+
+def event(name, **fields):
+    # Callers supply only allowlisted operational metadata, never exception messages,
+    # URLs, headers, form fields, audio, or transcripts.
+    logger.info(json.dumps({"event": name, **fields}, sort_keys=True))
+
+
+def connection_detail(error):
+    cause = error.reason if isinstance(error, URLError) else error
+    fields = {"exception_type": type(cause).__name__}
+    number = getattr(cause, "errno", None)
+    if isinstance(number, int):
+        fields["errno"] = number
+    return fields
 
 
 @dataclass
@@ -34,6 +53,10 @@ class Config:
     job_timeout: float = 1800
     retention: float = 3600
     poll_seconds: float = 2
+    wake_retry_seconds: float = 10
+    session_seconds: int = 30 * 24 * 3600
+    browser_username: str = "owner"
+    browser_password: str = ""
     max_attempts: int = 2
     max_upload: int = 25 * 1024 * 1024
     max_storage: int = 256 * 1024 * 1024
@@ -50,6 +73,10 @@ class Config:
             raise ValueError("ASR_API_KEY must contain at least 24 characters")
         if not self.model:
             raise ValueError("ASR_MODEL is required")
+        if not self.browser_username or len(self.browser_username) > 128:
+            raise ValueError("ASR_BROWSER_USERNAME must contain 1-128 characters")
+        if self.browser_password and len(self.browser_password) < 16:
+            raise ValueError("ASR_BROWSER_PASSWORD must contain at least 16 characters")
         for url in [self.backend_url, self.health_url] + ([self.wake_url] if self.wake_mode == "http" else []):
             parts = urlsplit(url)
             if parts.scheme not in ("http", "https") or not parts.hostname or parts.username or parts.fragment:
@@ -60,7 +87,7 @@ class Config:
             raise ValueError("ASR_WAKE_HOST is required")
         if self.wake_mode == "wol" and len(bytes.fromhex(self.wake_mac.replace(":", "").replace("-", ""))) != 6:
             raise ValueError("Invalid Wake-on-LAN MAC")
-        for name in ("ready_timeout", "inference_timeout", "sync_timeout", "job_timeout", "retention", "poll_seconds", "max_attempts", "max_upload", "max_storage", "max_jobs"):
+        for name in ("ready_timeout", "inference_timeout", "sync_timeout", "job_timeout", "retention", "poll_seconds", "wake_retry_seconds", "session_seconds", "max_attempts", "max_upload", "max_storage", "max_jobs"):
             if getattr(self, name) <= 0:
                 raise ValueError(name + " must be positive")
 
@@ -114,7 +141,20 @@ class Store:
             job_id = uuid.uuid4().hex
             now = time.time()
             db.execute("INSERT INTO jobs(id,key,fingerprint,state,created,updated,body,content_type) VALUES(?,?,?,'queued',?,?,?,?)", (job_id, key, fingerprint, now, now, body, content_type))
-            return job_id
+        event("job_accepted", job_id=job_id, bytes=len(body))
+        return job_id
+
+    def retry(self, job_id, key):
+        job = self.get(job_id)
+        if not job:
+            raise KeyError(job_id)
+        if job["state"] != "failed" or job["body"] is None:
+            raise ConflictError()
+        # A retry is a new job, preserving the failed attempt's history. Namespace
+        # the caller's key so retries do not collide with original submissions.
+        new_id = self.submit(job["body"], job["content_type"], "retry:" + job_id + ":" + key)
+        event("job_retry_requested", job_id=new_id, previous_job_id=job_id)
+        return new_id
 
     def get(self, job_id):
         with self.connect() as db:
@@ -124,13 +164,16 @@ class Store:
     def recover(self):
         # Must be called only by the process holding the exclusive dispatcher lock.
         with self.connect() as db:
-            db.execute("UPDATE jobs SET state='queued', attempt=NULL WHERE state IN ('waking','transcribing')")
+            count = db.execute("UPDATE jobs SET state='queued', attempt=NULL WHERE state IN ('waking','transcribing')").rowcount
+        event("dispatcher_recovered", jobs=count)
 
     def claim(self):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             now = time.time()
-            db.execute("UPDATE jobs SET state='failed', error='job_deadline_or_attempt_limit', body=NULL, updated=? WHERE state='queued' AND (created < ? OR attempts >= ?)", (now, now-self.config.job_timeout, self.config.max_attempts))
+            expired = db.execute("UPDATE jobs SET state='failed', error='job_deadline_or_attempt_limit', updated=? WHERE state='queued' AND (created < ? OR attempts >= ?)", (now, now-self.config.job_timeout, self.config.max_attempts)).rowcount
+            if expired:
+                event("jobs_exhausted", jobs=expired)
             row = db.execute("SELECT * FROM jobs WHERE state='queued' ORDER BY created LIMIT 1").fetchone()
             if not row:
                 return None
@@ -138,11 +181,14 @@ class Store:
             db.execute("UPDATE jobs SET state='waking', error=NULL, backend_status=NULL, attempt=?, attempts=attempts+1, updated=? WHERE id=?", (attempt, now, row["id"]))
             job = dict(row)
             job.update(attempt=attempt, attempts=row["attempts"]+1)
-            return job
+        event("job_claimed", job_id=job["id"], attempt=job["attempts"], state="waking")
+        return job
 
     def transcribing(self, job):
         with self.connect() as db:
-            db.execute("UPDATE jobs SET state='transcribing', updated=? WHERE id=? AND attempt=?", (time.time(), job["id"], job["attempt"]))
+            changed = db.execute("UPDATE jobs SET state='transcribing', updated=? WHERE id=? AND attempt=?", (time.time(), job["id"], job["attempt"])).rowcount
+        if changed:
+            event("job_transcribing", job_id=job["id"], attempt=job["attempts"])
 
     def finish(self, job, result, content_type, status):
         with self.connect() as db:
@@ -151,16 +197,22 @@ class Store:
             used = db.execute("SELECT COALESCE(SUM(COALESCE(LENGTH(body),0)+COALESCE(LENGTH(result),0)),0) FROM jobs WHERE id!=?", (job["id"],)).fetchone()[0]
             if used + len(result) > self.config.max_storage:
                 raise CapacityError()
-            db.execute("UPDATE jobs SET state='succeeded', body=NULL, result=?, result_type=?, backend_status=?, updated=? WHERE id=? AND attempt=? AND state='transcribing'", (result, content_type, status, time.time(), job["id"], job["attempt"]))
+            changed = db.execute("UPDATE jobs SET state='succeeded', body=NULL, result=?, result_type=?, backend_status=?, updated=? WHERE id=? AND attempt=? AND state='transcribing'", (result, content_type, status, time.time(), job["id"], job["attempt"])).rowcount
+        if changed:
+            event("job_succeeded", job_id=job["id"], attempt=job["attempts"], elapsed_seconds=round(time.time()-job["created"], 3), backend_status=status)
 
-    def fail(self, job, reason, retry=False, status=None):
+    def fail(self, job, reason, retry=False, status=None, stage=None, detail=None):
         retry = retry and job["attempts"] < self.config.max_attempts and time.time()-job["created"] < self.config.job_timeout
         with self.connect() as db:
-            db.execute("UPDATE jobs SET state=?, error=?, backend_status=?, body=CASE WHEN ? THEN body ELSE NULL END, updated=? WHERE id=? AND attempt=? AND state IN ('waking','transcribing')", ("queued" if retry else "failed", reason, status, retry, time.time(), job["id"], job["attempt"]))
+            changed = db.execute("UPDATE jobs SET state=?, error=?, backend_status=?, updated=? WHERE id=? AND attempt=? AND state IN ('waking','transcribing')", ("queued" if retry else "failed", reason, status, time.time(), job["id"], job["attempt"])).rowcount
+        if changed:
+            event("job_requeued" if retry else "job_failed", job_id=job["id"], attempt=job["attempts"], reason=reason, stage=stage, backend_status=status, elapsed_seconds=round(time.time()-job["created"], 3), **(detail or {}))
 
     def cleanup(self):
         with self.connect() as db:
-            db.execute("DELETE FROM jobs WHERE state IN ('succeeded','failed') AND updated < ?", (time.time()-self.config.retention,))
+            count = db.execute("DELETE FROM jobs WHERE state IN ('succeeded','failed') AND updated < ?", (time.time()-self.config.retention,)).rowcount
+        if count:
+            event("jobs_expired", jobs=count)
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -172,6 +224,7 @@ class Backend:
     def __init__(self, config):
         self.config = config
         self.opener = build_opener(ProxyHandler({}), NoRedirect())
+        self.readiness_detail = {}
 
     def headers(self):
         return {"Authorization": "Bearer " + self.config.backend_key} if self.config.backend_key else {}
@@ -179,8 +232,14 @@ class Backend:
     def ready(self):
         try:
             with self.opener.open(Request(self.config.health_url, headers=self.headers()), timeout=3) as response:
+                self.readiness_detail = {"health_status": response.status}
                 return response.status == 200
-        except (OSError, URLError):
+        except HTTPError as error:
+            self.readiness_detail = {"health_status": error.code}
+            error.close()
+            return False
+        except (OSError, URLError) as error:
+            self.readiness_detail = connection_detail(error)
             return False
 
     def wake(self):
@@ -220,26 +279,50 @@ class Dispatcher:
 
     def process(self, job):
         c = self.store.config
+        stage = "readiness"
         try:
             if not self.backend.ready():
-                self.backend.wake()
                 deadline = min(time.monotonic()+c.ready_timeout, time.monotonic()+max(0, c.job_timeout-(time.time()-job["created"])))
+                wake_sent, next_wake = False, 0
+                last_detail = None
                 while not self.stop.is_set() and time.monotonic() < deadline:
+                    detail = getattr(self.backend, "readiness_detail", {})
+                    if detail != last_detail:
+                        event("backend_waiting", job_id=job["id"], attempt=job["attempts"], **detail)
+                        last_detail = dict(detail)
+                    if not wake_sent and time.monotonic() >= next_wake:
+                        try:
+                            self.backend.wake()
+                            wake_sent = True
+                            event("wake_sent", job_id=job["id"], mode=c.wake_mode)
+                        except (OSError, URLError) as error:
+                            # Wake delivery can be uncertain. Keep polling readiness
+                            # and retry wake inside this attempt's startup window.
+                            extra = {"wake_status": error.code} if isinstance(error, HTTPError) else connection_detail(error)
+                            event("wake_failed", job_id=job["id"], attempt=job["attempts"], **extra)
+                            if isinstance(error, HTTPError):
+                                error.close()
+                            next_wake = time.monotonic() + c.wake_retry_seconds
                     if self.backend.ready():
                         break
                     self.stop.wait(c.poll_seconds)
                 else:
-                    self.store.fail(job, "backend_not_ready", retry=True)
+                    if self.stop.is_set():
+                        return  # Leave the claim for startup recovery.
+                    self.store.fail(job, "backend_not_ready", retry=True, stage=stage, detail=getattr(self.backend, "readiness_detail", {}))
                     return
+            stage = "transcription"
             self.store.transcribing(job)
             body, content_type, status = self.backend.transcribe(job)
+            stage = "result_storage"
             self.store.finish(job, body, content_type, status)
         except HTTPError as error:
-            self.store.fail(job, "backend_http_error", retry=error.code in (408, 429, 500, 502, 503, 504), status=error.code)
-        except (URLError, OSError, TimeoutError):
-            self.store.fail(job, "backend_connection_error", retry=True)
+            self.store.fail(job, "backend_http_error", retry=error.code in (408, 429, 500, 502, 503, 504), status=error.code, stage=stage)
+            error.close()
+        except (URLError, OSError, TimeoutError) as error:
+            self.store.fail(job, "backend_connection_error", retry=True, stage=stage, detail=connection_detail(error))
         except (ValueError, CapacityError):
-            self.store.fail(job, "backend_response_rejected")
+            self.store.fail(job, "backend_response_rejected", stage=stage)
 
     def run(self):
         self.store.recover()
