@@ -447,6 +447,20 @@ time.sleep(60)
         self.assertNotIn("synthetic-audio", result.stdout)
         self.assertNotIn(KEY, result.stdout)
 
+    def test_login_document_preserves_native_form_origin(self):
+        status, body, headers = self.call("/", auth="")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Referrer-Policy"], "same-origin")
+        self.assertIn(b'action="/login" method="post"', body)
+
+    def test_login_still_rejects_null_missing_and_foreign_origins(self):
+        form = urlencode({"username": "owner", "password": KEY}).encode()
+        for origin, reason in (("", "missing_origin"), ("null", "null_origin"), ("https://foreign.example.test", "origin_host_mismatch")):
+            status, body, _ = self.call("/login", "POST", form, auth="",
+                CONTENT_TYPE="application/x-www-form-urlencoded", HTTP_HOST="asr.example.test", HTTP_ORIGIN=origin)
+            self.assertEqual(status, 403)
+            self.assertEqual(json.loads(body)["reason"], reason)
+
 
 if __name__ == "__main__":
     unittest.main()

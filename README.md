@@ -104,6 +104,8 @@ node --test tests/recorder.test.cjs
 
 The Node controller tests use DOM/fetch stubs and do not establish actual browser microphone or password-manager behavior. The second Python command also binds loopback sockets to exercise the real TCP wake adapter and HTTP forwarding. CI runs it and builds the container. Tests include forced process termination, stale attempts, transient and permanent backend failures, delayed readiness, retained requests after synchronous timeout, limits, authentication, and expiry.
 
+CI also runs `python tests/browser_login.py` using Playwright/Chromium and a temporary local HTTPS server. This regression reproduces native form failure under `Referrer-Policy: no-referrer`, then checks login, model selection, and session persistence with the actual application header. The application uses `same-origin`: `no-referrer` can cause native form POSTs to send `Origin: null`. The browser test does not automate the password-manager save popup or microphone recording.
+
 The container uses Gunicorn; the dependency-free development entry point is `python3 -m asr_gateway.serve` with the same environment configuration and `ASR_DATABASE` set to a writable path. Its development HTTP server is not a production server.
 
 The manual **Publish container** workflow tests, builds, and publishes `ghcr.io/<repository-owner>/<repository-name>:<version>`. Invoke it with a numeric version such as `0.1.0`; publishing is never triggered by a pull request. Make the GHCR package public afterward. The image build context has an allowlist, excluding runtime configuration and recordings. The first image targets the CI runner's amd64 architecture, suitable for the intended CPU host.

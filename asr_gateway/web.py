@@ -7,7 +7,7 @@ from http import HTTPStatus
 from pathlib import Path
 from urllib.parse import parse_qs
 
-from .core import CapacityError, ConflictError
+from .core import CapacityError, ConflictError, event
 from . import session
 
 
@@ -23,7 +23,9 @@ class App:
             start_response(f"{status} {HTTPStatus(status).phrase}", [
                 ("Content-Type", content_type), ("Content-Length", str(len(body))),
                 ("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff"),
-                ("Referrer-Policy", "no-referrer"), *extra])
+                # Native form POSTs can send Origin:null under no-referrer.
+                # Preserve same-origin form metadata without sharing cross-site referrers.
+                ("Referrer-Policy", "same-origin"), *extra])
             return [body]
 
         path, method = env.get("PATH_INFO", ""), env.get("REQUEST_METHOD", "GET")
@@ -37,7 +39,10 @@ class App:
         signing_key = session.signing_key(self.config)
         if method == "POST" and path == "/login":
             if env.get("HTTP_ORIGIN") != "https://" + env.get("HTTP_HOST", ""):
-                return respond(403, {"error": "same_origin_https_required"})
+                origin = env.get("HTTP_ORIGIN")
+                reason = "missing_origin" if not origin else "null_origin" if origin == "null" else "origin_host_mismatch"
+                event("login_origin_rejected", reason=reason)
+                return respond(403, {"error": "same_origin_https_required", "reason": reason})
             try:
                 size = int(env.get("CONTENT_LENGTH") or "0")
             except ValueError:
